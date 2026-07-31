@@ -370,7 +370,7 @@ validate_person_inputs <- function(person_inputs, label = "Person") {
     if (item$amount <= 0) return(validation_result(sprintf("%s voluntary contribution %s amount must be positive", label, i)))
     if (!is.finite(item$startAge)) return(validation_result(sprintf("%s voluntary contribution %s needs a start age", label, i)))
     if (item$startAge < person_inputs$start_age) return(validation_result(sprintf("%s voluntary contribution %s cannot start before the model start age", label, i)))
-    if (item$startAge > person_inputs$withdrawal_age) return(validation_result(sprintf("%s voluntary contribution %s cannot start after the KiwiSaver withdrawal age", label, i)))
+    if (item$startAge >= person_inputs$withdrawal_age) return(validation_result(sprintf("%s voluntary contribution %s must start before the KiwiSaver withdrawal age", label, i)))
     if (identical(item$type, "recurring")) {
       if (!(is.finite(item$endAge) && item$endAge > item$startAge)) return(validation_result(sprintf("%s recurring voluntary contribution %s needs an end age after the start age", label, i)))
       if (item$endAge > person_inputs$withdrawal_age) return(validation_result(sprintf("%s recurring voluntary contribution %s cannot end after the KiwiSaver withdrawal age", label, i)))
@@ -522,19 +522,22 @@ calc_kiwisaver <- function(dob, start_age, withdrawal_age, current_balance, annu
           if (!is.na(contribution_date) &&
               contribution_date == segment_start &&
               !is.na(eligibility_start_date) &&
-              !is.na(eligibility_end_date) &&
               contribution_date >= eligibility_start_date &&
-              contribution_date < eligibility_end_date) {
+              contribution_date < withdrawal_date) {
             oneoff_at_start <- oneoff_at_start + item$amount
             oneoff_applied[j] <- TRUE
           }
         }
       }
     }
+    
     if (oneoff_at_start > 0) {
       balance <- balance + oneoff_at_start
       total_voluntary <- total_voluntary + oneoff_at_start
-      member_sum_this_govt_year <- member_sum_this_govt_year + oneoff_at_start
+      
+      if (!is.na(eligibility_end_date) && segment_start < eligibility_end_date) {
+        member_sum_this_govt_year <- member_sum_this_govt_year + oneoff_at_start
+      }
     }
 
     balance_after_interest <- balance * (1 + annual_return_rate)^year_fraction
@@ -543,7 +546,11 @@ calc_kiwisaver <- function(dob, start_age, withdrawal_age, current_balance, annu
 
     annual_salary <- annual_salary_at(segment_start)
     esct_rate <- if (isTRUE(fiscal_drag)) get_esct_rate_for_income(annual_salary) else get_esct_rate_for_income(annual_income)
-    eligible_age <- !is.na(eligibility_start_date) &&
+    contribution_eligible <- !is.na(eligibility_start_date) &&
+      segment_start >= eligibility_start_date &&
+      segment_start < withdrawal_date
+    
+    govt_eligible <- !is.na(eligibility_start_date) &&
       !is.na(eligibility_end_date) &&
       segment_start >= eligibility_start_date &&
       segment_start < eligibility_end_date
@@ -558,9 +565,10 @@ calc_kiwisaver <- function(dob, start_age, withdrawal_age, current_balance, annu
       if (identical(active_break$pauseType, "reduce-both") && is.finite(active_break$reducedRate)) { member_rate_used <- active_break$reducedRate / 100; employer_rate_used <- active_break$reducedRate / 100 }
     }
 
-    member_contribution <- if (eligible_age) annual_salary * member_rate_used * year_fraction else 0
+    member_contribution <- if (contribution_eligible) annual_salary * member_rate_used * year_fraction else 0
+    
     recurring_voluntary <- 0
-    if (eligible_age && length(voluntary_contributions)) {
+    if (contribution_eligible && length(voluntary_contributions)) {
       for (item in voluntary_contributions) {
         if (identical(item$type, "recurring")) {
           start_date <- age_to_date(dob, item$startAge)
@@ -571,11 +579,12 @@ calc_kiwisaver <- function(dob, start_age, withdrawal_age, current_balance, annu
         }
       }
     }
-    employer_gross <- if (eligible_age) annual_salary * employer_rate_used * year_fraction else 0
+    
+    employer_gross <- if (contribution_eligible) annual_salary * employer_rate_used * year_fraction else 0
     employer_contribution <- employer_gross * (1 - esct_rate / 100)
-
+    
     govt_contribution <- 0
-    if (eligible_age) {
+    if (govt_eligible) {
       member_sum_this_govt_year <- member_sum_this_govt_year + member_contribution + recurring_voluntary
       if (annual_salary > govt_threshold) income_exceeded_this_govt_year <- TRUE
     }
@@ -736,14 +745,56 @@ compute_retirement_outputs <- function(primary_inputs, primary_projection, scena
   nzs_displayed <- if (scenario_settings$display_real) nzs_pv_at_elig / ((1 + iR)^full_years(first_eligibility)) else nzs_pv_at_elig
   ks_schedule_you <- simulate_ks_decumulation_schedule(primary_projection$nom, primary_inputs$withdrawal_age, primary_inputs$start_age, scenario_settings$income_rule, iR, rR)
   ks_schedule_partner <- if (couple_mode && !is.null(partner_projection)) simulate_ks_decumulation_schedule(partner_projection$nom, partner_inputs$withdrawal_age, partner_inputs$start_age, scenario_settings$income_rule, iR, rR) else NULL
-  age_today_int <- floor(age_from_dob(primary_inputs$dob, Sys.Date()))
-  years_to_ret_age <- max(0, primary_inputs$withdrawal_age - age_today_int)
-  net_at_ret_age <- calculate_disposable_income_with_acc(primary_inputs$annual_income * (1 + wg / 100)^years_to_ret_age)
-  base_index_years <- max(0, round(nza) - age_today_int)
-  year1_nzsuper_base <- if (!couple_mode && primary_inputs$withdrawal_age >= nza) { if (identical(indexation, "hybrid")) 0.65 * indexed_couple_nzs_annual_hybrid(base_index_years) else nz_base_single_now } else 0
-  year1_nzsuper <- apply_income_test(year1_nzsuper_base, primary_inputs$withdrawal_age, years_to_ret_age)
-  year1_ks <- (ks_schedule_you[[as.character(round(primary_inputs$withdrawal_age))]] %||% list(incomeNom = 0))$incomeNom
-  replacement_rate <- if (!couple_mode && round(primary_inputs$withdrawal_age) == 65 && net_at_ret_age > 0) (year1_ks + year1_nzsuper) / net_at_ret_age else NA_real_
+  exact_years_to_withdrawal <- get_years_to_specific_age(
+    primary_inputs$dob,
+    primary_inputs$withdrawal_age,
+    primary_inputs$model_start_choice %||% "today"
+  )
+  
+  if (!(is.finite(exact_years_to_withdrawal) && exact_years_to_withdrawal >= 0)) {
+    exact_years_to_withdrawal <- max(
+      0,
+      primary_inputs$withdrawal_age - primary_inputs$start_age
+    )
+  }
+  
+  gross_at_withdrawal <- primary_inputs$annual_income *
+    (1 + wg / 100)^exact_years_to_withdrawal
+  
+  net_at_withdrawal <- calculate_disposable_income_with_acc(
+    gross_at_withdrawal
+  )
+  
+  year1_nzsuper_base <- if (!couple_mode && primary_inputs$withdrawal_age >= nza) {
+    nzs_payment_annual(
+      years_from_start = exact_years_to_withdrawal,
+      eligible_count = 1
+    )
+  } else {
+    0
+  }
+  
+  year1_nzsuper <- apply_income_test(
+    year1_nzsuper_base,
+    primary_inputs$withdrawal_age,
+    exact_years_to_withdrawal
+  )
+  
+  year1_ks <- (
+    ks_schedule_you[[
+      as.character(round(primary_inputs$withdrawal_age))
+    ]] %||% list(incomeNom = 0)
+  )$incomeNom
+  
+  replacement_rate <- if (
+    !couple_mode &&
+    round(primary_inputs$withdrawal_age) == 65 &&
+    net_at_withdrawal > 0
+  ) {
+    (year1_ks + year1_nzsuper) / net_at_withdrawal
+  } else {
+    NA_real_
+  }
   replacement_rate_note <- if (couple_mode) "Replacement rate is not shown in couple mode because a single household replacement rate can be misleading when partners have different ages or withdrawal ages." else if (round(primary_inputs$withdrawal_age) != 65) "Replacement rate is only shown when KiwiSaver withdrawal age is 65." else "First-year retirement income at age 65 as a share of projected disposable employment income at age 65, after income tax and ACC earners' levy."
   income_rows <- lapply(65:90, function(age) {
     years_from_start <- max(0, age - primary_inputs$start_age)
